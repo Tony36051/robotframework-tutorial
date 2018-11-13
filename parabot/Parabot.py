@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
+import datetime
 import glob
-from multiprocessing import Pool, cpu_count, freeze_support
-import sys
+import logging
 import os
 import shutil
-import datetime
-import logging
+import sys
+from multiprocessing import Pool, cpu_count, freeze_support
+from multiprocessing_logging import install_mp_handler
 
 from robot import rebot
 from robot.conf import RobotSettings
@@ -69,8 +70,8 @@ class Parabot(RobotFramework):
         self._assert_test_count()  # 如果没有要测试的, 直接退出, 返回码: 1
         self.output_dir = settings['OutputDir']
         self.clean_output_dir()  # 删掉主要输出目录下所有东东, 类似rm -rf self.output_dir
-        p_num = (int(options['processes']) if 'processes' in options else 2 * cpu_count()) + 1  # 1 read process
         self.log_debug_info(options)
+        p_num = (int(options['processes']) if 'processes' in options else 2 * cpu_count())
         start_time, end_time = self.parallel_run(options, p_num)
         self.merge_report(start_time, end_time)
 
@@ -113,6 +114,7 @@ class Parabot(RobotFramework):
         logger.info('run start at: {}'.format(start_time))
 
         freeze_support()  # 兼容windows, 避免由于程序frozen导致的RuntimeError
+        install_mp_handler()
         pool = Pool(processes=p_num)
         pool.map_async(run_robot_star, zip(repeat(options), self.long_names, repeat(self.data_source)))
         pool.close()
@@ -138,7 +140,7 @@ class Parabot(RobotFramework):
             rebot(*outputs, stdout=stdout, **options)
 
 
-def run_robot_star(options_test_source):
+def run_robot_star(options_test_source):  # compatible for python2
     """Convert `f((options,test,source))` to `f(options,test, data_source)` call."""
     return run_robot(*options_test_source)
 
@@ -150,13 +152,13 @@ def run_robot(options, test, data_source):
     options['report'] = None
     options['test'] = test
     options['prerunmodifier'] = TeardownCleaner()
+    process_reportportal_options(options)
     stdout = os.path.join(sub_dir, 'stdout.log')
     stderr = os.path.join(sub_dir, 'stderr.log')
-    process_reportportal_options(options)
     with open(stdout, 'w') as stdout, open(stderr, 'w') as stderr:
-        # options['stdout'] = stdout
-        # options['stderr'] = stderr
         ret_code = run(data_source, stdout=stdout, stderr=stderr, **options)
+    logger.info('{pid}:\t[{status}] {long_name}'
+                .format(pid=os.getpid(), status='PASS' if ret_code == 0 else "FAIL", long_name=test))
     return ret_code
 
 
