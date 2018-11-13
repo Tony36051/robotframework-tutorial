@@ -1,25 +1,48 @@
 # -*- coding: utf-8 -*-
-from itertools import repeat
-from multiprocessing import cpu_count, freeze_support
-
-from robot.conf import RobotSettings
-from robot.output import LOGGER
-from robot.run import RobotFramework, USAGE, run
-from robot.running import TestSuiteBuilder
-
-from robot.utils import Application, unic
+import glob
+from multiprocessing import Pool, cpu_count, freeze_support
 import sys
 import os
+import shutil
+import datetime
+import logging
 
-try:
-    from itertools import izip as zip
-except ImportError:  # python3
-    pass
+from robot import rebot
+from robot.conf import RobotSettings
+from robot.model import SuiteVisitor
+from robot.output import LOGGER
+from robot.run import RobotFramework, run, USAGE
+from robot.running import TestSuiteBuilder
+from robot.utils import unic, Application
 
-USAGE_EXT = """parabot_options:
-===============
- -p --processes num       How many processes to be run.
-"""
+# Syntax sugar.
+_ver = sys.version_info
+is_py2 = (_ver[0] == 2)  #: Python 2.x?
+is_py3 = (_ver[0] == 3)  #: Python 3.x?
+if is_py2:
+    from itertools import izip as zip, repeat
+if is_py3:
+    from itertools import repeat
+
+
+class TeardownCleaner(SuiteVisitor):
+    def end_test(self, test):
+        if not test.keywords.teardown:
+            test.keywords.create(name='Run Keywords', type='teardown',
+                                 args=['Run Keyword And Ignore Error', 'Close Browser', 'AND',
+                                       'Run Keyword And Ignore Error', 'Disconnect From Database'])
+
+
+logger = logging.getLogger('parabot')
+console = logging.StreamHandler()
+logger.addHandler(console)
+logger.setLevel(logging.DEBUG)
+# logging.getLogger(name='requests').setLevel(logging.WARNING)
+# logging.getLogger(name='selenium').setLevel(logging.WARNING)
+
+USAGE_EXT = """ExtOptions  
+==========  
+ -p --processes num       How many processes to be run.=========="""
 
 
 class Parabot(RobotFramework):
@@ -28,76 +51,129 @@ class Parabot(RobotFramework):
         extended_usage = "\n".join([first_half, USAGE_EXT, last_half])
         Application.__init__(self, extended_usage, arg_limits=(1,),
                              env_options='ROBOT_OPTIONS', logger=LOGGER)
+        self.output_dir = None
+        self.data_source = None
         self.long_names = []
 
     def main(self, data_sources, **options):
         settings = RobotSettings(options)
         LOGGER.register_console_logger(**settings.console_output_config)
-        LOGGER.info('Settings:\n%s' % unic(settings))
+        LOGGER.info("Settings:\n%s" % unic(settings))
         suite = TestSuiteBuilder(settings['SuiteNames'],
                                  settings['WarnOnSkipped'],
                                  settings['Extension']).build(*data_sources)
         suite.configure(**settings.suite_config)
-        p_num = int(options['processes']) if "processes" in options else 2 * cpu_count()
-        data_sources = data_sources[0]  # support only one data_source
-        self._split_tests(suite)
-        self.parallel_run(options, data_sources)
+        self._support_python_path(options)
+        self._split_tests(suite)  # 递归，找到所有的tests, 写入self.long_names
+        self._assert_data_source(data_sources)  # 只取第一个DataSource, 写入self.data_source
+        self._assert_test_count()  # 如果没有要测试的, 直接退出, 返回码: 1
+        self.output_dir = settings['OutputDir']
+        self.clean_output_dir()  # 删掉主要输出目录下所有东东, 类似rm -rf self.output_dir
+        p_num = (int(options['processes']) if 'processes' in options else 2 * cpu_count()) + 1  # 1 read process
+        self.log_debug_info(options)
+        start_time, end_time = self.parallel_run(options, p_num)
+        self.merge_report(start_time, end_time)
+
+    def _support_python_path(self, opts):
+        if self._ap._auto_pythonpath and opts.get('pythonpath'):
+            sys.path = self._ap._get_pythonpath(opts['pythonpath']) + sys.path
 
     def _split_tests(self, suite):
         if suite.suites:
-            for suite in suite.suites:
-                self._split_tests(suite)
+            for sub_suite in suite.suites:
+                self._split_tests(sub_suite)
         else:
             for test in suite.tests:
-                self.long_names.append(test.longname)
+                self.long_names.append(test.longname)  # 从根的suite到叶的testcase串起来的longname
 
-    def parallel_run(self, options, data_source, process_num=1):
-        import multiprocessing
-        freeze_support()
-        pool = multiprocessing.Pool(process_num)
-        result = pool.map_async(robot_star, zip(repeat(options), self.long_names, repeat(data_source)))
-        result.wait()
-        if result.ready():  # 线程函数是否已经启动了
-            if result.successful():  # 线程函数是否执行成功
-                print(result.get())  # 线程函数返回值
+    def _assert_data_source(self, data_sources):
+        if len(data_sources) > 1:
+            raise ValueError("Support only ONE data source")
+        self.data_source = data_sources[0]
+
+    def _assert_test_count(self):
+        if len(self.long_names) <= 0:
+            exit(1)
+
+    def clean_output_dir(self):
+        path = self.output_dir
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        elif os.path.exists(path):
+            os.remove(path)
+        # os.mkdir(path)
+
+    def log_debug_info(self, options):
+        logger.debug("robot_options:\n" + "\n".join(["{}->{}".format(x[0], x[1]) for x in options.items()]))
+        logger.debug("tests({}) to run:\n".format(len(self.long_names)) + "\n".join(self.long_names))
+        logger.debug("data_source: " + self.data_source)
+
+    def parallel_run(self, options, p_num):
+        start_time = datetime.datetime.now()
+        logger.info('run start at: {}'.format(start_time))
+
+        freeze_support()  # 兼容windows, 避免由于程序frozen导致的RuntimeError
+        pool = Pool(processes=p_num)
+        pool.map_async(run_robot_star, zip(repeat(options), self.long_names, repeat(self.data_source)))
+        pool.close()
+        pool.join()
+
+        end_time = datetime.datetime.now()
+        logger.info('run end at: {}'.format(end_time))
+        logger.info('run elapsed time: {}'.format(end_time - start_time))
+        return start_time, end_time
+
+    def merge_report(self, start_time, end_time):
+        path = os.path.join(self.output_dir, '*', 'output.xml')
+        outputs = glob.glob(path)
+        options = {
+            "merge": True,
+            "loglevel": "WARN",
+            "starttime": str(start_time),
+            "endtime": str(end_time),
+            "outputdir": self.output_dir,
+            "output": "output.xml"
+        }
+        with open(os.path.join(self.output_dir, 'merge.log'), 'w') as stdout:
+            rebot(*outputs, stdout=stdout, **options)
 
 
-def robot_star(opts_t_ds):
-    return robot(*opts_t_ds)
+def run_robot_star(options_test_source):
+    """Convert `f((options,test,source))` to `f(options,test, data_source)` call."""
+    return run_robot(*options_test_source)
 
 
-def robot(options, test, data_source):
+def run_robot(options, test, data_source):
+    sub_dir = os.path.join(options['outputdir'], test)
+    os.makedirs(sub_dir)
+    options['outputdir'] = sub_dir
+    options['report'] = None
     options['test'] = test
-    options['outputdir'] += os.path.sep + test
-    os.makedirs(options['outputdir'])
-    stdout = os.path.join(options['outputdir'], test + ".out")
-    stderr = os.path.join(options['outputdir'], test + ".err")
+    options['prerunmodifier'] = TeardownCleaner()
+    stdout = os.path.join(sub_dir, 'stdout.log')
+    stderr = os.path.join(sub_dir, 'stderr.log')
+    process_reportportal_options(options)
     with open(stdout, 'w') as stdout, open(stderr, 'w') as stderr:
-        run(data_source, **options, stdout=stdout, stderr=stderr)
+        # options['stdout'] = stdout
+        # options['stderr'] = stderr
+        ret_code = run(data_source, stdout=stdout, stderr=stderr, **options)
+    return ret_code
 
 
-def parabot_cli(arguments, exit=True):
-    """Command line execution entry point for running tests.
-    :param arguments: Command line options and arguments as a list of strings.
-    :param exit: If ``True``, call ``sys.exit`` with the return code denoting
-        execution status, otherwise just return the rc. New in RF 3.0.1.
-    Entry point used when running tests from the command line, but can also
-    be used by custom scripts that execute tests. Especially useful if the
-    script itself needs to accept same arguments as accepted by Robot Framework,
-    because the script can just pass them forward directly along with the
-    possible default values it sets itself.
-    Example::
-        from robot import run_cli
-        # Run tests and return the return code.
-        rc = run_cli(['--name', 'Example', 'tests.robot'], exit=False)
-        # Run tests and exit to the system automatically.
-        run_cli(['--name', 'Example', 'tests.robot'])
-    See also the :func:`run` function that allows setting options as keyword
-    arguments like ``name="Example"`` and generally has a richer API for
-    programmatic test execution.
-    """
+def process_reportportal_options(options):
+    if 'variable' not in options:
+        return
+    for i, var in enumerate(options['variable']):
+        if str(var).startswith('RP_LAUNCH'):
+            options['variable'][i] = "RP_LAUNCH:" + options['test']
+            # TODO: download agent binary code
+
+
+def run_cli(arguments, exit=True):
+    """Command line execution entry point for running tests.  
+    See robot.run.run_cli"""
     return Parabot().execute_cli(arguments, exit=exit)
 
 
 if __name__ == '__main__':
-    parabot_cli(sys.argv[1:])
+    run_cli(sys.argv[1:])
