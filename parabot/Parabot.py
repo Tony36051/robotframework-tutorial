@@ -6,6 +6,9 @@ import os
 import shutil
 import sys
 from multiprocessing import Pool, cpu_count, freeze_support
+
+from robot.running.model import Timeout
+
 from multiprocessing_logging import install_mp_handler
 
 from robot import rebot
@@ -27,6 +30,16 @@ if is_py3:
 
 
 class TeardownCleaner(SuiteVisitor):
+    MESSAGE_FOR_RESULT = 'Test timeout {value} exceeded, added by {Modifier}'
+
+    def __init__(self, value):
+        self.timeout = value
+
+    def start_test(self, test):
+        if not test.timeout:
+            test.timeout = [self.timeout, TeardownCleaner.MESSAGE_FOR_RESULT.format(Modifier=self.__class__.__name__,
+                                                                                    value=self.timeout)]
+
     def end_test(self, test):
         if not test.keywords.teardown:
             test.keywords.create(name='Run Keywords', type='teardown',
@@ -151,7 +164,7 @@ def run_robot(options, test, data_source):
     options['outputdir'] = sub_dir
     options['report'] = None
     options['test'] = test
-    options['prerunmodifier'] = TeardownCleaner()
+    options['prerunmodifier'] = TeardownCleaner(4.5)
     process_reportportal_options(options)
     stdout = os.path.join(sub_dir, 'stdout.log')
     stderr = os.path.join(sub_dir, 'stderr.log')
